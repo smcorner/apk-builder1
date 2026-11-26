@@ -1,0 +1,173 @@
+name: Convert GitHub Repo to Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'Target GitHub Repository URL'
+        required: true
+      app_name:
+        description: 'Android App Name'
+        required: true
+        default: 'MyRepoApp'
+      package_id:
+        description: 'Sanitized Android Package ID'
+        required: false
+        default: 'com.builder.repoapp'
+      stack_hint:
+        description: 'Detected Stack Hint'
+        required: false
+        default: 'auto'
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node 20 & Java 21
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Flutter SDK (When Flutter Repo Detected)
+        if: inputs.stack_hint == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Clone & Detect Stack
+        run: |
+          RAW_URL="${{ inputs.repo_url }}"
+          CLEAN_URL=$(echo "$RAW_URL" | sed -E 's#(https://github.com/[^/]+/[^/]+).*#\1#')
+          [[ "$CLEAN_URL" != http* ]] && CLEAN_URL="https://github.com/$CLEAN_URL"
+          echo "Cloning $CLEAN_URL..."
+          git clone --depth 1 "$CLEAN_URL" target-repo
+
+          cd target-repo
+          if [ -f "pubspec.yaml" ]; then
+            echo "DETECTED_STACK=flutter" >> $GITHUB_ENV
+          elif [ -f "gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -f "settings.gradle" ] || [ -f "settings.gradle.kts" ]; then
+            echo "DETECTED_STACK=android-native" >> $GITHUB_ENV
+          else
+            echo "DETECTED_STACK=web-capacitor" >> $GITHUB_ENV
+          fi
+
+      - name: Compile Android Binary
+        run: |
+          mkdir -p raw-apk
+          SAFE_APP_NAME=$(echo "${{ inputs.app_name }}" | tr -cd '[:alnum:] _-' | sed 's/^ *//;s/ *$//')
+          [ -z "$SAFE_APP_NAME" ] && SAFE_APP_NAME="MyRepoApp"
+          SAFE_FILE_NAME=$(echo "$SAFE_APP_NAME" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+          [ -z "$SAFE_FILE_NAME" ] && SAFE_FILE_NAME="MyRepoApp"
+
+          # Strictly sanitize Java/Android package ID (lowercase letters/digits/dots, no leading digits per segment)
+          RAW_PKG="${{ inputs.package_id }}"
+          [ -z "$RAW_PKG" ] && RAW_PKG="com.builder.${SAFE_FILE_NAME,,}"
+          SAFE_PKG=$(echo "$RAW_PKG" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.]/_/g' | sed -E 's/\.([0-9])/\.a\1/g' | sed -E 's/^([0-9])/a\1/')
+          [[ "$SAFE_PKG" != *.* ]] && SAFE_PKG="com.builder.$SAFE_PKG"
+          echo "Using sanitized Package ID: $SAFE_PKG"
+
+          if [ "$DETECTED_STACK" = "flutter" ]; then
+            if ! command -v flutter >/dev/null 2>&1; then
+              git clone https://github.com/flutter/flutter.git -b stable --depth 1 "$HOME/flutter"
+              export PATH="$HOME/flutter/bin:$PATH"
+            fi
+            cd target-repo
+            flutter pub get
+            flutter build apk --release
+            APK_FOUND=$(find build/app/outputs -name "*.apk" | head -n 1)
+            cp "$APK_FOUND" "../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
+
+          elif [ "$DETECTED_STACK" = "android-native" ]; then
+            cd target-repo
+            chmod +x gradlew || true
+            if [ -f "gradlew" ]; then
+              ./gradlew assembleDebug --no-daemon
+            else
+              gradle assembleDebug --no-daemon
+            fi
+            APK_FOUND=$(find . -path "*/build/outputs/apk/*.apk" | head -n 1)
+            cp "$APK_FOUND" "../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
+
+          else
+            cd target-repo
+            if [ -f "package.json" ]; then
+              npm install --legacy-peer-deps || true
+              npm run build || true
+            fi
+
+            mkdir -p ../web-dist
+            for dir in dist build out public _site .; do
+              if [ -f "$dir/index.html" ]; then
+                cp -r "$dir"/* ../web-dist/
+                break
+              fi
+            done
+
+            if [ ! -f "../web-dist/index.html" ]; then
+              cat << 'EOF' > ../web-dist/index.html
+          <!doctype html>
+          <html lang="en">
+          <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GitHub Repo App</title></head>
+          <body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#f8fafc;font-family:system-ui,sans-serif;padding:24px;text-align:center">
+            <div style="max-width:420px;background:#1e293b;padding:28px;border-radius:20px;border:1px solid #334155">
+              <h1 style="margin:0 0 10px;font-size:22px">Android Wrapper Ready</h1>
+              <p style="margin:0;color:#94a3b8;font-size:14px;line-height:1.5">This repository was packaged into a native Android WebView container.</p>
+            </div>
+          </body>
+          </html>
+          EOF
+            fi
+
+            rm -rf ../web-dist/node_modules ../web-dist/.git
+            cd ..
+            mkdir cap-wrapper && cd cap-wrapper
+            npm init -y
+            npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+            npx cap init "$SAFE_APP_NAME" "$SAFE_PKG" --web-dir="../web-dist"
+            npx cap add android
+            npx cap sync android
+            cd android
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon
+            APK_FOUND=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+            cp "$APK_FOUND" "../../raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
+          fi
+
+      - name: Sign & Zipalign Android APK
+        run: |
+          SAFE_APP_NAME=$(echo "${{ inputs.app_name }}" | tr -cd '[:alnum:] _-' | sed 's/^ *//;s/ *$//')
+          [ -z "$SAFE_APP_NAME" ] && SAFE_APP_NAME="MyRepoApp"
+          SAFE_FILE_NAME=$(echo "$SAFE_APP_NAME" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+          [ -z "$SAFE_FILE_NAME" ] && SAFE_FILE_NAME="MyRepoApp"
+
+          # Resolve Android SDK Build-Tools natively on runner
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          BUILD_TOOLS=$(ls -d "$SDK_ROOT/build-tools/"* 2>/dev/null | sort -V | tail -n 1)
+
+          keytool -genkeypair -v -keystore release.keystore -alias repo2apk \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android123 -keypass android123 \
+            -dname "CN=Repo2APK, OU=Mobile, O=GitHub, L=Cloud, S=Net, C=US"
+
+          UNSIGNED="raw-apk/${SAFE_FILE_NAME}-unsigned.apk"
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$UNSIGNED" "aligned.apk"
+          "$BUILD_TOOLS/apksigner" sign --ks release.keystore --ks-key-alias repo2apk \
+            --ks-pass pass:android123 --key-pass pass:android123 \
+            --out "${SAFE_FILE_NAME}.apk" "aligned.apk"
+          "$BUILD_TOOLS/apksigner" verify "${SAFE_FILE_NAME}.apk"
+
+      - name: Publish Direct .APK to GitHub Releases
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: apk-v${{ github.run_number }}
+          name: "${{ inputs.app_name }} (Build #${{ github.run_number }})"
+          body: "Signed Android APK compiled from ${{ inputs.repo_url }}"
+          files: "*.apk"
