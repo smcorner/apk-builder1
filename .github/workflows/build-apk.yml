@@ -67,11 +67,22 @@ jobs:
           SAFE_FILE_NAME=$(echo "$SAFE_APP_NAME" | tr ' ' '_' | tr -cd '[:alnum:]_-')
           [ -z "$SAFE_FILE_NAME" ] && SAFE_FILE_NAME="MyRepoApp"
 
-          # Strictly sanitize Java/Android package ID (lowercase letters/digits/dots, no leading digits per segment)
+          # Strictly sanitize Java/Android package ID (every dot-separated segment must start with a-z)
           RAW_PKG="${{ inputs.package_id }}"
           [ -z "$RAW_PKG" ] && RAW_PKG="com.builder.${SAFE_FILE_NAME,,}"
-          SAFE_PKG=$(echo "$RAW_PKG" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.]/_/g' | sed -E 's/\.([0-9])/\.a\1/g' | sed -E 's/^([0-9])/a\1/')
-          [[ "$SAFE_PKG" != *.* ]] && SAFE_PKG="com.builder.$SAFE_PKG"
+          SAFE_PKG=$(echo "$RAW_PKG" | tr '[:upper:]' '[:lower:]' | awk -F. '{
+            out=""
+            for(i=1;i<=NF;i++){
+              gsub(/[^a-z0-9_]/, "", $i)
+              if($i != ""){
+                if($i !~ /^[a-z]/) $i = "app" $i
+                out = (out == "" ? $i : out "." $i)
+              }
+            }
+            if(out == "") out = "com.builder.repoapp"
+            if(out !~ /\./) out = "com.builder." out
+            print out
+          }')
           echo "Using sanitized Package ID: $SAFE_PKG"
 
           if [ "$DETECTED_STACK" = "flutter" ]; then
@@ -104,14 +115,43 @@ jobs:
             fi
 
             mkdir -p ../web-dist
+            # Search common build output folders first, then nested subfolders up to depth 3
+            FOUND_HTML=""
             for dir in dist build out public _site .; do
               if [ -f "$dir/index.html" ]; then
-                cp -r "$dir"/* ../web-dist/
+                FOUND_HTML="$dir/index.html"
                 break
               fi
             done
+            if [ -z "$FOUND_HTML" ]; then
+              FOUND_HTML=$(find . -maxdepth 3 -name "index.html" -not -path "*/node_modules/*" | head -n 1)
+            fi
 
-            if [ ! -f "../web-dist/index.html" ]; then
+            if [ -n "$FOUND_HTML" ]; then
+              HTML_DIR=$(dirname "$FOUND_HTML")
+              cp -r "$HTML_DIR"/* ../web-dist/
+              # Rewrite root-relative asset paths (/assets/ -> ./assets/) so Capacitor WebView loads them cleanly
+              find ../web-dist -maxdepth 2 -name "*.html" -exec sed -i -E 's/(href|src)="\/(assets|static|js|css)\//\1=".\/\2\//g' {} + || true
+            elif [ -f "README.md" ] || [ -f "readme.md" ]; then
+              # Convert README / Awesome-List repositories into a searchable, mobile-friendly Android app
+              node -e '
+                const fs = require("fs");
+                const mdFile = fs.existsSync("README.md") ? "README.md" : "readme.md";
+                const md = fs.readFileSync(mdFile, "utf8");
+                const items = [];
+                const linkRe = /\[(.*?)\]\((https?:\/\/[^)]+)\)(?:\s*[-–—:]\s*(.*))?/g;
+                let m;
+                while ((m = linkRe.exec(md)) !== null) {
+                  items.push({ title: m[1], url: m[2], desc: m[3] || "" });
+                }
+                const title = process.env.APP_TITLE || "Repository App";
+                const cards = items.length
+                  ? items.map(i => `<a class="card" href="${i.url}" target="_blank"><h3>${i.title}</h3><p>${i.desc || i.url}</p></a>`).join("")
+                  : `<pre style="white-space:pre-wrap;font-size:13px;">${md.replace(/</g,"&lt;")}</pre>`;
+                const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{font-family:system-ui,sans-serif;background:#0f172a;color:#f8fafc;margin:0;padding:16px}header{position:sticky;top:0;background:#0f172a;padding-bottom:12px}input{width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid #334155;background:#1e293b;color:#fff;font-size:15px}.card{display:block;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:14px;margin-bottom:10px;text-decoration:none;color:inherit}h3{margin:0 0 4px;font-size:15px;color:#38bdf8}p{margin:0;font-size:12px;color:#94a3b8;word-break:break-all}</style></head><body><header><h2 style="margin:0 0 10px">${title}</h2><input id="q" placeholder="Search ${items.length} items..." oninput="filter()"></header><div id="list">${cards}</div><script>function filter(){const v=document.getElementById("q").value.toLowerCase();document.querySelectorAll(".card").forEach(c=>c.style.display=c.textContent.toLowerCase().includes(v)?"block":"none")}<\/script></body></html>`;
+                fs.writeFileSync("../web-dist/index.html", html);
+              ' APP_TITLE="$SAFE_APP_NAME"
+            else
               cat << 'EOF' > ../web-dist/index.html
           <!doctype html>
           <html lang="en">
@@ -142,11 +182,13 @@ jobs:
           fi
 
       - name: Sign & Zipalign Android APK
+        id: sign
         run: |
           SAFE_APP_NAME=$(echo "${{ inputs.app_name }}" | tr -cd '[:alnum:] _-' | sed 's/^ *//;s/ *$//')
           [ -z "$SAFE_APP_NAME" ] && SAFE_APP_NAME="MyRepoApp"
           SAFE_FILE_NAME=$(echo "$SAFE_APP_NAME" | tr ' ' '_' | tr -cd '[:alnum:]_-')
           [ -z "$SAFE_FILE_NAME" ] && SAFE_FILE_NAME="MyRepoApp"
+          echo "apk_filename=${SAFE_FILE_NAME}.apk" >> "$GITHUB_OUTPUT"
 
           # Resolve Android SDK Build-Tools natively on runner
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
@@ -162,12 +204,22 @@ jobs:
           "$BUILD_TOOLS/apksigner" sign --ks release.keystore --ks-key-alias repo2apk \
             --ks-pass pass:android123 --key-pass pass:android123 \
             --out "${SAFE_FILE_NAME}.apk" "aligned.apk"
-          "$BUILD_TOOLS/apksigner" verify "${SAFE_FILE_NAME}.apk"
+          "$BUILD_TOOLS/apksigner" verify --verbose "${SAFE_FILE_NAME}.apk"
+
+          # Delete intermediate unsigned & aligned APKs so ONLY the final signed APK is published
+          rm -f "aligned.apk" "$UNSIGNED" raw-apk/*.apk
+
+      - name: Clean Existing Tag On Re-Run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="apk-v${{ github.run_number }}-${{ github.run_attempt }}"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
 
       - name: Publish Direct .APK to GitHub Releases
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: apk-v${{ github.run_number }}
+          tag_name: apk-v${{ github.run_number }}-${{ github.run_attempt }}
           name: "${{ inputs.app_name }} (Build #${{ github.run_number }})"
           body: "Signed Android APK compiled from ${{ inputs.repo_url }}"
-          files: "*.apk"
+          files: "${{ steps.sign.outputs.apk_filename }}"
